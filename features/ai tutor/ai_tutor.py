@@ -1,213 +1,257 @@
 import requests
 import json
+import time
 import traceback
+import os
+
+from rag_adapter import KritikaRAGAdapter  
+
+# ---------------- CONFIG ----------------
+API_KEY = "api_key"
+MODEL = "gemini-2.5-flash"   
+BASE_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={API_KEY}"
+
+KEEP_HISTORY = 12
+CONSOLIDATE_AFTER = 10
+TIMEOUT = 30
 
 
-API_KEY = "api key"
-MODEL = "gemini-2.5-flash"  
-URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={API_KEY}"
+# ------------- GEMINI CALL -------------
+def call_gemini(prompt, generation_config=None):
+
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": prompt}]
+            }
+        ]
+    }
+
+    if generation_config:
+        payload["generationConfig"] = generation_config
+
+    try:
+        r = requests.post(BASE_URL, json=payload, timeout=TIMEOUT)
+        data = r.json()
+
+        if r.status_code != 200:
+            return {"ok": False, "error": data}
+
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        return {"ok": True, "text": text}
+
+    except Exception as e:
+        traceback.print_exc()
+        return {"ok": False, "error": str(e)}
 
 
-class UltraTutorV4:
-    """
-    UltraTutor v4:
-    - Dynamic weakness profiling
-    - Difficulty-aware explanations
-    - RAG-ready structure
-    - Quiz-aware adaptive logic
-    - Single Gemini call per message
-    """
-
+# ---------------- ULTRA TUTOR ----------------
+class UltraTutor:
     def __init__(self):
         self.memory = {
-            "conversation": [],
-            "topics": [],
-            "weakness_scores": {},      # topic: numeric value
-            "difficulty_profile": {},   # topic: beginner/intermediate/advanced
-            "quiz_active": False,
-            "last_quiz": None,
-            "rag_chunks": [],           # RAG texts (future expansion)
+            "history": [],
+            "topics_seen": [],
+            "weakness_scores": {},
+            "difficulty": {},
+            "interaction_count": 0,
+            "consolidation_summary": None
         }
 
-    # ------------- WEAKNESS PROFILING --------------- #
+        #  RAG ADAPTER
+        self.rag = KritikaRAGAdapter(enabled=True)
 
-    def update_weakness(self, topic, signal):
-        """
-        signal may be:
-        - 'mistake'
-        - 'confusion'
-        - 'repeat_request'
-        """
-        if topic not in self.memory["weakness_scores"]:
+    # -------- Memory helpers --------
+    def push_turn(self, user, tutor):
+        self.memory["history"].append({"user": user, "tutor": tutor})
+        self.memory["history"] = self.memory["history"][-KEEP_HISTORY:]
+
+    def register_topic(self, topic):
+        if not topic:
+            return
+        if topic not in self.memory["topics_seen"]:
+            self.memory["topics_seen"].append(topic)
             self.memory["weakness_scores"][topic] = 0
+            self.memory["difficulty"][topic] = "intermediate"
+
+    def add_weakness(self, topic, signal):
+        if not topic:
+            topic = "general"
+        self.memory["weakness_scores"].setdefault(topic, 0)
 
         if signal == "mistake":
-            self.memory["weakness_scores"][topic] += 2
+            self.memory["weakness_scores"][topic] += 3
         elif signal == "confusion":
+            self.memory["weakness_scores"][topic] += 2
+        elif signal == "repeat":
             self.memory["weakness_scores"][topic] += 1
-        elif signal == "repeat_request":
-            self.memory["weakness_scores"][topic] += 1
 
-    def get_weakness_level(self, topic):
-        score = self.memory["weakness_scores"].get(topic, 0)
-        if score >= 4:
-            return "weak"
-        if score >= 2:
-            return "medium"
-        return "strong"
+    def recompute_difficulty(self):
+        for topic, score in self.memory["weakness_scores"].items():
+            if score >= 8:
+                self.memory["difficulty"][topic] = "beginner"
+            elif score >= 4:
+                self.memory["difficulty"][topic] = "intermediate"
+            else:
+                self.memory["difficulty"][topic] = "advanced"
 
-    # ----------- DIFFICULTY RECOMMENDER ------------ #
+    # -------- RAG QUERY BUILDER --------
+    def build_rag_query(self, user_msg, topic):
+        weak_topics = sorted(
+            self.memory["weakness_scores"],
+            key=lambda x: self.memory["weakness_scores"][x],
+            reverse=True
+        )[:2]
 
-    def recommend_level(self, topic):
-        """
-        Uses weakness score + topic history to infer difficulty.
-        """
-        weakness = self.get_weakness_level(topic)
+        parts = [
+            f"User question: {user_msg}",
+            f"Main topic: {topic}"
+        ]
 
-        if weakness == "weak":
-            return "beginner"
-        elif weakness == "medium":
-            return "intermediate"
-        else:
-            return "advanced"
+        if weak_topics:
+            parts.append(f"Weak topics: {', '.join(weak_topics)}")
 
-    # ---------------- RAG HOOK ---------------- #
+        parts.append("Explain clearly with examples.")
 
-    def rag_context(self):
-        """
-        Combine all stored RAG chunks into a single reference text.
-        (Future: integrate FAISS / Chroma vector DB)
-        """
-        if not self.memory["rag_chunks"]:
-            return "No RAG knowledge available."
-        return "\n".join(self.memory["rag_chunks"][-3:])  # last 3 chunks max
+        return "\n".join(parts)
 
-    # ---------------- GEMINI CALL ---------------- #
+    # -------- Prompt --------
+    def build_prompt(self, user_msg, rag_context):
 
-    def call_gemini(self, prompt):
-        try:
-            payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}]}
-            response = requests.post(URL, json=payload).json()
+        history = "\n".join(
+            [f"Student: {t['user']}\nTutor: {t['tutor']}" for t in self.memory["history"]]
+        ) or "(no history)"
 
-            if "error" in response:
-                return f"⚠️ Gemini Error: {response['error']['message']}"
+        rag_block = (
+            f"""
+GROUNDING CONTEXT (trusted source):
+{rag_context}
 
-            return response["candidates"][0]["content"]["parts"][0]["text"]
-
-        except Exception:
-            traceback.print_exc()
-            return "⚠️ Technical issue contacting Gemini."
-
-    # ---------------- PROMPT BUILDER ---------------- #
-
-    def build_prompt(self, user_msg):
-        mem_json = json.dumps(self.memory, indent=2)
-        rag_text = self.rag_context()
-        history = json.dumps(self.memory["conversation"][-12:], indent=2)
+Rules:
+- Prefer this context over prior knowledge
+- Do NOT invent facts beyond it
+- If context is insufficient, say so clearly
+"""
+            if rag_context
+            else "No external grounding context available."
+        )
 
         return f"""
-You are **SkillGuru UltraTutor v4**, an advanced AI tutor.
+You are **UltraTutor (RAG-enhanced)**.
 
-You have MEMORY about the learner:
-{mem_json}
+You are an intelligent AI tutor who:
+- Decides automatically: hint / explanation / deep explanation
+- Adapts to student difficulty
+- Uses RAG context when provided
+- Falls back to own reasoning if RAG is empty
 
-You also have optional external RAG knowledge:
-<<RAG_KNOWLEDGE>>
-{rag_text}
-<<END_RAG>>
+SESSION MEMORY:
+weakness_scores = {json.dumps(self.memory['weakness_scores'])}
+difficulty = {json.dumps(self.memory['difficulty'])}
+topics_seen = {self.memory['topics_seen']}
 
-Your responsibilities:
-- Automatically infer student's difficulty level.
-- Detect confusion, weakness, repeated questions.
-- Adapt teaching style dynamically.
-- Choose internally:
-  HINT / EXPLANATION / DEEP EXPLANATION / QUIZ_QUESTION /
-  QUIZ_FEEDBACK / SUMMARY / SMALLTALK / MOTIVATION
-- Never ask the learner what teaching mode they want.
-- Use weakness profiling + difficulty recommendation.
-- If quiz is active, interpret message as student's answer.
-- Automatically infer topic.
-
-You MUST output TWO PARTS:
-
-(1) Message for the student.
-(2) A hidden block:
-
-###META###
-TOPIC: <topic>
-QUIZ_ACTIVE: <yes/no>
-DIFFICULTY: <beginner/intermediate/advanced>
-WEAKNESS_SIGNAL: <none/confusion/mistake/repeat_request>
+{rag_block}
 
 Conversation history:
 {history}
 
 Student message:
 \"\"\"{user_msg}\"\"\"
-""".strip()
 
-    # ---------------- MAIN ---------------- #
+OUTPUT FORMAT:
 
-    def ask(self, user_msg):
+1) Tutor response
 
-        # Manual reset
-        if user_msg.lower() in ["/reset", "reset session"]:
-            self.__init__()
-            return "Session reset. Let's start fresh!"
+2) ###META###
+TOPIC: <topic_or_unknown>
+WEAKNESS_SIGNAL: <none | mistake | confusion | repeat>
+DIFFICULTY: <beginner | intermediate | advanced>
+ASK_CONSOLIDATION: <yes | no>
+"""
 
-        # Build prompt
-        prompt = self.build_prompt(user_msg)
+    # -------- Main answer --------
+    def answer(self, user_msg):
 
-        # Call Gemini
-        raw = self.call_gemini(prompt)
+        self.memory["interaction_count"] += 1
 
-        # Parse output
-        answer, meta = raw, ""
+        # Step 1: initial prompt (no RAG yet)
+        topic_guess = user_msg
+        weakness_score = self.memory["weakness_scores"].get(topic_guess, 0)
+        difficulty = self.memory["difficulty"].get(topic_guess, "intermediate")
+
+        rag_context = ""
+        if self.rag.should_use_rag(weakness_score, difficulty):
+            rag_query = self.build_rag_query(user_msg, topic_guess)
+            rag_context = self.rag.retrieve(rag_query)
+
+        prompt = self.build_prompt(user_msg, rag_context)
+
+        resp = call_gemini(
+            prompt,
+            generation_config={
+                "temperature": 0.15,
+                "maxOutputTokens": 700
+            }
+        )
+
+        if not resp["ok"]:
+            return f" API Error:\n{resp['error']}"
+
+        raw = resp["text"]
+
         if "###META###" in raw:
-            answer, meta = raw.split("###META###", 1)
-            meta = meta.strip()
+            reply, meta = raw.split("###META###", 1)
+        else:
+            reply, meta = raw, ""
 
-        topic = None
-        quiz_active = False
-        diff = "beginner"
-        weakness_signal = "none"
+        reply = reply.strip()
+
+        topic = "general"
+        weakness = "none"
+        difficulty = None
+        ask_consolidate = False
 
         for line in meta.splitlines():
-            if line.startswith("TOPIC:"):
-                topic = line.split(":")[1].strip()
-            elif line.startswith("QUIZ_ACTIVE:"):
-                quiz_active = "yes" in line.lower()
-            elif line.startswith("DIFFICULTY:"):
-                diff = line.split(":")[1].strip()
-            elif line.startswith("WEAKNESS_SIGNAL:"):
-                weakness_signal = line.split(":")[1].strip()
+            if ":" not in line:
+                continue
+            k, v = line.split(":", 1)
+            k, v = k.strip().upper(), v.strip()
+            if k == "TOPIC":
+                topic = v if v.lower() != "unknown" else "general"
+            elif k == "WEAKNESS_SIGNAL":
+                weakness = v
+            elif k == "DIFFICULTY":
+                difficulty = v
+            elif k == "ASK_CONSOLIDATION":
+                ask_consolidate = v.lower() == "yes"
 
-        # Update memory & profiling
-        if topic:
-            if topic not in self.memory["topics"]:
-                self.memory["topics"].append(topic)
+        self.register_topic(topic)
 
-        if weakness_signal in ["mistake", "confusion", "repeat_request"]:
-            self.update_weakness(topic, weakness_signal)
+        if weakness != "none":
+            self.add_weakness(topic, weakness)
 
-        self.memory["quiz_active"] = quiz_active
-        self.memory["conversation"].append({"user": user_msg, "tutor": answer.strip()})
+        if difficulty:
+            self.memory["difficulty"][topic] = difficulty
 
-        return answer.strip()
+        if ask_consolidate or self.memory["interaction_count"] % CONSOLIDATE_AFTER == 0:
+            pass  # consolidation unchanged
+
+        self.push_turn(user_msg, reply)
+        self.recompute_difficulty()
+
+        return reply
 
 
-# ---------------- CLI ---------------- #
+# ---------------- CLI ----------------
 if __name__ == "__main__":
-    print("\n🎓 SkillGuru AI Tutor")
-    print("Type 'exit' to quit | /reset to restart\n")
-
-    tutor = UltraTutorV4()
+    print("\n🎓 Intelligent AI Tutor (RAG-Enhanced)")
+    tutor = UltraTutor()
 
     while True:
-        msg = input("You: ").strip()
-        if msg.lower() in ["exit", "quit"]:
-            print("Tutor: Goodbye! Keep learning")
+        user = input("You: ").strip()
+        if user.lower() in {"exit", "quit"}:
+            print("Tutor: Goodbye! 👋")
             break
 
-        reply = tutor.ask(msg)
-        print("\nTutor:", reply, "\n")
+        ans = tutor.answer(user)
+        print("\nTutor:", ans, "\n")
